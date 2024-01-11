@@ -1,5 +1,5 @@
 import torch
-from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
+from diff_gaussian_rasterization import GaussianRasterizationSettings
 
 def setup_camera(w, h, k, w2c, near=0.01, far=100):
     fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
@@ -11,7 +11,7 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
                                 [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
                                 [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
     full_proj = w2c.bmm(opengl_proj)
-    cam = Camera(
+    raster_settings = GaussianRasterizationSettings(
         image_height=h,
         image_width=w,
         tanfovx=w / (2 * fx),
@@ -24,4 +24,4 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
         campos=cam_center,
         prefiltered=False
     )
-    return cam
+    return raster_settings

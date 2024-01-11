@@ -115,16 +115,50 @@ def params2rendervar(params):
     return rendervar
 
 
+# RGB Rendering settings
 def transformed_params2rendervar(params, transformed_pts):
+    # # transformed_pts: 相机视角下的means3D，即相机视角的高斯的中心位置
+    rendervar = {
+        'means3D': transformed_pts, # 3D point的位置 3
+        'colors_precomp': params['rgb_colors'], # 颜色 3
+        'rotations': F.normalize(params['unnorm_rotations']), # 旋转 4(wxyz)
+        'opacities': torch.sigmoid(params['logit_opacities']), # 每个高斯的透明度 1
+        'scales': torch.exp(torch.tile(params['log_scales'], (1, 3))), # 轴的长度 3
+        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
+    }
+    return rendervar
+
+# Depth & Silhouette Rendering settings
+def transformed_params2depthplussilhouette(params, w2c, transformed_pts):
+    # transformed_pts: 相机视角下的means3D，即相机视角的高斯的中心位置
     rendervar = {
         'means3D': transformed_pts,
-        'colors_precomp': params['rgb_colors'],
+        'colors_precomp': get_depth_and_silhouette(transformed_pts, w2c),
         'rotations': F.normalize(params['unnorm_rotations']),
         'opacities': torch.sigmoid(params['logit_opacities']),
         'scales': torch.exp(torch.tile(params['log_scales'], (1, 3))),
         'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
     }
     return rendervar
+
+def get_depth_and_silhouette(pts_3D, w2c):
+    """
+    Function to compute depth and silhouette for each gaussian.
+    These are evaluated at gaussian center.
+    """
+    # Depth of each gaussian center in camera frame
+    pts4 = torch.cat((pts_3D, torch.ones_like(pts_3D[:, :1])), dim=-1)
+    pts_in_cam = (w2c @ pts4.transpose(0, 1)).transpose(0, 1)
+    depth_z = pts_in_cam[:, 2].unsqueeze(-1) # [num_gaussians, 1]
+    depth_z_sq = torch.square(depth_z) # [num_gaussians, 1]
+
+    # Depth and Silhouette
+    depth_silhouette = torch.zeros((pts_3D.shape[0], 3)).cuda().float()
+    depth_silhouette[:, 0] = depth_z.squeeze(-1)
+    depth_silhouette[:, 1] = 1.0
+    depth_silhouette[:, 2] = depth_z_sq.squeeze(-1)
+    
+    return depth_silhouette
 
 
 def project_points(points_3d, intrinsics):
@@ -169,42 +203,10 @@ def transformed_params2silhouette(params, transformed_pts):
     return rendervar
 
 
-def get_depth_and_silhouette(pts_3D, w2c):
-    """
-    Function to compute depth and silhouette for each gaussian.
-    These are evaluated at gaussian center.
-    """
-    # Depth of each gaussian center in camera frame
-    pts4 = torch.cat((pts_3D, torch.ones_like(pts_3D[:, :1])), dim=-1)
-    pts_in_cam = (w2c @ pts4.transpose(0, 1)).transpose(0, 1)
-    depth_z = pts_in_cam[:, 2].unsqueeze(-1) # [num_gaussians, 1]
-    depth_z_sq = torch.square(depth_z) # [num_gaussians, 1]
-
-    # Depth and Silhouette
-    depth_silhouette = torch.zeros((pts_3D.shape[0], 3)).cuda().float()
-    depth_silhouette[:, 0] = depth_z.squeeze(-1)
-    depth_silhouette[:, 1] = 1.0
-    depth_silhouette[:, 2] = depth_z_sq.squeeze(-1)
-    
-    return depth_silhouette
-
-
 def params2depthplussilhouette(params, w2c):
     rendervar = {
         'means3D': params['means3D'],
         'colors_precomp': get_depth_and_silhouette(params['means3D'], w2c),
-        'rotations': F.normalize(params['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
-        'scales': torch.exp(torch.tile(params['log_scales'], (1, 3))),
-        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
-    }
-    return rendervar
-
-
-def transformed_params2depthplussilhouette(params, w2c, transformed_pts):
-    rendervar = {
-        'means3D': transformed_pts,
-        'colors_precomp': get_depth_and_silhouette(transformed_pts, w2c),
         'rotations': F.normalize(params['unnorm_rotations']),
         'opacities': torch.sigmoid(params['logit_opacities']),
         'scales': torch.exp(torch.tile(params['log_scales'], (1, 3))),

@@ -167,7 +167,14 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         if "crop_edge" in config_dict["camera_params"].keys():
             self.crop_edge = config_dict["camera_params"]["crop_edge"]
 
-        self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths()
+        load_object = True
+        self.object_paths = []
+        if load_object:
+            self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths()
+        else:
+            self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths()
+        
+        
         if len(self.color_paths) != len(self.depth_paths):
             raise ValueError("Number of color and depth images must be the same.")
         if self.load_embeddings:
@@ -296,8 +303,12 @@ class GradSLAMDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         color_path = self.color_paths[index]
         depth_path = self.depth_paths[index]
+        # object_path = self.object_paths[index]
+
         color = np.asarray(imageio.imread(color_path), dtype=float)
         color = self._preprocess_color(color)
+        # objects =np.asarray(imageio.imread(object_path), dtype=float) if os.path.exists(object_path) else None
+        
         if ".png" in depth_path:
             # depth_data = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
             depth = np.asarray(imageio.imread(depth_path), dtype=np.int64)

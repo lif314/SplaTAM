@@ -3,9 +3,12 @@ from os.path import join as p_join
 
 primary_device = "cuda:0"
 
-scenes = ["freiburg1_desk", "freiburg1_desk2", "freiburg1_room", "freiburg2_xyz", "freiburg3_long_office_household"]
+# scenes = ["freiburg1_desk", "freiburg1_desk2", "freiburg1_room", "freiburg2_xyz", "freiburg3_long_office_household"]
+# scenes = ["freiburg1_desk"]
+# scenes = ["freiburg3_long_office_household"]
+scenes = ["freiburg1_desk"]
 
-seed = int(0)
+seed = int(1)
 scene_name = scenes[int(0)]
 
 map_every = 1
@@ -17,6 +20,8 @@ scene_radius_depth_ratio = 2
 
 group_name = "TUM"
 run_name = f"{scene_name}_seed{seed}"
+
+data_dir = "/home/super/nerf/slam/SplaTAM/data/TUM"
 
 config = dict(
     workdir=f"./experiments/{group_name}",
@@ -35,7 +40,8 @@ config = dict(
     checkpoint_time_idx=0,
     save_checkpoints=False, # Save Checkpoints
     checkpoint_interval=100, # Checkpoint Interval
-    use_wandb=True,
+    # use_wandb=True,
+    use_wandb=False,
     wandb=dict(
         entity="theairlab",
         project="SplaTAM",
@@ -45,13 +51,14 @@ config = dict(
         eval_save_qual=True,
     ),
     data=dict(
-        basedir="./data/TUM_RGBD",
+        # basedir="./data/TUM_RGBD",
+        basedir=data_dir,
         gradslam_data_cfg=f"./configs/data/TUM/{scene_name}.yaml",
         sequence=f"rgbd_dataset_{scene_name}",
         desired_image_height=480,
         desired_image_width=640,
         start=0,
-        end=-1,
+        end=2,
         stride=1,
         num_frames=-1,
     ),

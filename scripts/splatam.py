@@ -33,8 +33,10 @@ from datasets.gradslam_datasets import (
     RealsenseDataset,
     TUMDataset,
     ScannetPPDataset,
-    NeRFCaptureDataset
+    NeRFCaptureDataset,
+    KITTIDataset
 )
+
 from utils.common_utils import seed_everything, save_params_ckpt, save_params
 from utils.eval_helpers import report_loss, report_progress, eval
 from utils.keyframe_selection import keyframe_selection_overlap
@@ -45,7 +47,11 @@ from utils.slam_helpers import (
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+# GaussianRasterizer
+from diff_gaussian_rasterization import GaussianRasterizer
+
+# object
+# from diff_gaussian_rasterization_object import GaussianRasterizer as GaussianRasterizerObject
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -53,6 +59,8 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return ICLDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["replica"]:
         return ReplicaDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["kitti"]:
+        return KITTIDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["replicav2"]:
         return ReplicaV2Dataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["azure", "azurekinect"]:
@@ -130,15 +138,15 @@ def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True,
 
 def initialize_params(init_pt_cld, num_frames, mean3_sq_dist):
     num_pts = init_pt_cld.shape[0]
-    means3D = init_pt_cld[:, :3] # [num_gaussians, 3]
+    means3D = init_pt_cld[:, :3] # [num_gaussians, 3] 高斯中心的位置
     unnorm_rots = np.tile([1, 0, 0, 0], (num_pts, 1)) # [num_gaussians, 3]
     logit_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
     params = {
-        'means3D': means3D,
-        'rgb_colors': init_pt_cld[:, 3:6],
-        'unnorm_rotations': unnorm_rots,
-        'logit_opacities': logit_opacities,
-        'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)),
+        'means3D': means3D, # 高斯中心的位置 3
+        'rgb_colors': init_pt_cld[:, 3:6], # rgb颜色 3
+        'unnorm_rotations': unnorm_rots, # 旋转 wxyz 4
+        'logit_opacities': logit_opacities, # 透明度 1
+        'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)), # 轴的长度 3
     }
 
     # Initialize a single gaussian trajectory to model the camera poses relative to the first frame
@@ -170,9 +178,10 @@ def initialize_optimizer(params, lrs_dict, tracking):
     else:
         return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
-
+# 初始化第一帧的参数
 def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mean_sq_dist_method, densify_dataset=None):
     # Get RGB-D Data & Camera Parameters
+    # 读取第一帧数据: RGBM depth, 相机内参，c2w相对位姿
     color, depth, intrinsics, pose = dataset[0]
 
     # Process RGB-D Data
@@ -181,12 +190,14 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mea
     
     # Process Camera Parameters
     intrinsics = intrinsics[:3, :3]
+    # c2w转为w2c
     w2c = torch.linalg.inv(pose)
 
     # Setup Camera
+    # 设置相机参数
     cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), w2c.detach().cpu().numpy())
 
-    if densify_dataset is not None:
+    if densify_dataset is not None: # 不使用
         # Get Densification RGB-D Data & Camera Parameters
         color, depth, densify_intrinsics, _ = densify_dataset[0]
         color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
@@ -199,6 +210,7 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mea
     # Get Initial Point Cloud (PyTorch CUDA Tensor)
     mask = (depth > 0) # Mask out invalid depth values
     mask = mask.reshape(-1)
+    # 获取初始高斯参数
     init_pt_cld, mean3_sq_dist = get_pointcloud(color, depth, densify_intrinsics, w2c, 
                                                 mask=mask, compute_mean_sq_dist=True, 
                                                 mean_sq_dist_method=mean_sq_dist_method)
@@ -221,6 +233,8 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     # Initialize Loss Dictionary
     losses = {}
 
+    # 将各向同性高斯从世界帧变换到相机帧: transformed_pts
+    # transformed_pts: 相机视角下的means3D，即相机视角的高斯的中心位置
     if tracking:
         # Get current frame Gaussians, where only the camera pose gets gradient
         transformed_pts = transform_to_frame(params, iter_time_idx, 
@@ -244,17 +258,41 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
                                              camera_grad=False)
 
     # Initialize Render Variables
+    """
+    rendervar = {
+        'means3D': transformed_pts, # 相机视角下的means3D
+        'colors_precomp': params['rgb_colors'],
+        'rotations': F.normalize(params['unnorm_rotations']),
+        'opacities': torch.sigmoid(params['logit_opacities']),
+        'scales': torch.exp(torch.tile(params['log_scales'], (1, 3))),
+        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
+    }
+    """
     rendervar = transformed_params2rendervar(params, transformed_pts)
+
+    """
+    depth_sil_rendervar = {
+        'means3D': transformed_pts,
+        'colors_precomp': get_depth_and_silhouette(transformed_pts, w2c),
+        'rotations': F.normalize(params['unnorm_rotations']),
+        'opacities': torch.sigmoid(params['logit_opacities']),
+        'scales': torch.exp(torch.tile(params['log_scales'], (1, 3))),
+        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
+    }
+    """
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_pts)
 
     # RGB Rendering
     rendervar['means2D'].retain_grad()
-    im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+    im, radius, _, = GaussianRasterizer(raster_settings=curr_data['cam'])(**rendervar)
     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
 
-    # Depth & Silhouette Rendering
-    depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    # TODO Object Rendering
+
+
+    # Depth & Silhouette(轮廓) Rendering
+    depth_sil, _, _, = GaussianRasterizer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     depth = depth_sil[0, :, :].unsqueeze(0)
     silhouette = depth_sil[1, :, :]
     presence_sil_mask = (silhouette > sil_thres)
@@ -292,6 +330,9 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         losses['im'] = torch.abs(curr_data['im'] - im).sum()
     else:
         losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
+
+    # Object Loss
+    
 
     # Visualize the Diff Images
     if tracking and visualize_tracking_loss:
@@ -373,12 +414,13 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist):
     return params
 
 
+# 从当前帧中创建新的高斯集
 def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx, mean_sq_dist_method):
     # Silhouette Rendering
     transformed_pts = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_pts)
-    depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    depth_sil, _, _, = GaussianRasterizer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     silhouette = depth_sil[1, :, :]
     non_presence_sil_mask = (silhouette < sil_thres)
     # Check for new foreground objects by using GT depth
@@ -401,12 +443,17 @@ def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx, mean_sq
         curr_w2c[:3, 3] = curr_cam_tran
         valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
         non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
+        # 新的点云：从图像和深度图中获取点云
         new_pt_cld, mean3_sq_dist = get_pointcloud(curr_data['im'], curr_data['depth'], curr_data['intrinsics'], 
                                     curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
                                     mean_sq_dist_method=mean_sq_dist_method)
+        # 新的高斯集：从点云中创建高斯集
         new_params = initialize_new_params(new_pt_cld, mean3_sq_dist)
+        # 将新的高斯集中参数放入优化器中
         for k, v in new_params.items():
+            # 加入到整个高斯集中
             params[k] = torch.nn.Parameter(torch.cat((params[k], v), dim=0).requires_grad_(True))
+        # point number
         num_pts = params['means3D'].shape[0]
         variables['means2D_gradient_accum'] = torch.zeros(num_pts, device="cuda").float()
         variables['denom'] = torch.zeros(num_pts, device="cuda").float()
@@ -449,22 +496,27 @@ def convert_params_to_store(params):
     return params_to_store
 
 
+# 启动！
 def rgbd_slam(config: dict):
     # Print Config
     print("Loaded Config:")
+    # 是否使用深度损失来进行tracking
     if "use_depth_loss_thres" not in config['tracking']:
         config['tracking']['use_depth_loss_thres'] = False
         config['tracking']['depth_loss_thres'] = 100000
+    # 是否可视化深度损失
     if "visualize_tracking_loss" not in config['tracking']:
         config['tracking']['visualize_tracking_loss'] = False
     print(f"{config}")
 
     # Create Output Directories
+    # 创建输出目录
     output_dir = os.path.join(config["workdir"], config["run_name"])
     eval_dir = os.path.join(output_dir, "eval")
     os.makedirs(eval_dir, exist_ok=True)
     
     # Init WandB
+    # 默认不使用wandb
     if config['use_wandb']:
         wandb_time_step = 0
         wandb_tracking_step = 0
@@ -475,17 +527,20 @@ def rgbd_slam(config: dict):
                                name=config['wandb']['name'],
                                config=config)
 
-    # Get Device
+    # Get Device: cuda:0
     device = torch.device(config["primary_device"])
 
     # Load Dataset
     print("Loading Dataset ...")
+    # 数据集配置
     dataset_config = config["data"]
     if "gradslam_data_cfg" not in dataset_config:
         gradslam_data_cfg = {}
         gradslam_data_cfg["dataset_name"] = dataset_config["dataset_name"]
     else:
+        # load 数据集配置
         gradslam_data_cfg = load_dataset_config(dataset_config["gradslam_data_cfg"])
+
     if "ignore_bad" not in dataset_config:
         dataset_config["ignore_bad"] = False
     if "use_train_split" not in dataset_config:
@@ -493,6 +548,7 @@ def rgbd_slam(config: dict):
     if "densification_image_height" not in dataset_config:
         dataset_config["densification_image_height"] = dataset_config["desired_image_height"]
         dataset_config["densification_image_width"] = dataset_config["desired_image_width"]
+        # 默认False
         seperate_densification_res = False
     else:
         if dataset_config["densification_image_height"] != dataset_config["desired_image_height"] or \
@@ -510,6 +566,8 @@ def rgbd_slam(config: dict):
             seperate_tracking_res = True
         else:
             seperate_tracking_res = False
+
+
     # Poses are relative to the first frame
     dataset = get_dataset(
         config_dict=gradslam_data_cfg,
@@ -521,15 +579,17 @@ def rgbd_slam(config: dict):
         desired_height=dataset_config["desired_image_height"],
         desired_width=dataset_config["desired_image_width"],
         device=device,
-        relative_pose=True,
+        relative_pose=True, # 使用相对位姿
         ignore_bad=dataset_config["ignore_bad"],
         use_train_split=dataset_config["use_train_split"],
     )
+
     num_frames = dataset_config["num_frames"]
     if num_frames == -1:
         num_frames = len(dataset)
 
     # Init seperate dataloader for densification if required
+    # 默认False
     if seperate_densification_res:
         densify_dataset = get_dataset(
             config_dict=gradslam_data_cfg,
@@ -553,11 +613,13 @@ def rgbd_slam(config: dict):
                                                                         densify_dataset=densify_dataset)                                                                                                                  
     else:
         # Initialize Parameters & Canoncial Camera parameters
+        # 用第一帧初始化参数
         params, variables, intrinsics, first_frame_w2c, cam = initialize_first_timestep(dataset, num_frames, 
                                                                                         config['scene_radius_depth_ratio'],
                                                                                         config['mean_sq_dist_method'])
     
     # Init seperate dataloader for tracking if required
+    # 默认False
     if seperate_tracking_res:
         tracking_dataset = get_dataset(
             config_dict=gradslam_data_cfg,
@@ -579,7 +641,9 @@ def rgbd_slam(config: dict):
         tracking_cam = setup_camera(tracking_color.shape[2], tracking_color.shape[1], 
                                     tracking_intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
     
+
     # Initialize list to keep track of Keyframes
+    # 关键帧
     keyframe_list = []
     keyframe_time_indices = []
     
@@ -646,6 +710,7 @@ def rgbd_slam(config: dict):
         # Optimize only current time step for tracking
         iter_time_idx = time_idx
         # Initialize Mapping Data for selected frame
+        # 当前帧数据
         curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': iter_time_idx, 'intrinsics': intrinsics, 
                      'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
         
@@ -657,12 +722,14 @@ def rgbd_slam(config: dict):
             tracking_curr_data = {'cam': tracking_cam, 'im': tracking_color, 'depth': tracking_depth, 'id': iter_time_idx,
                                   'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
         else:
+            # 使用当前帧来进行Tracking
             tracking_curr_data = curr_data
 
         # Optimization Iterations
         num_iters_mapping = config['mapping']['num_iters']
         
         # Initialize the camera pose for the current frame
+        # 初始化当前帧的位姿参数
         if time_idx > 0:
             params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'])
 
@@ -680,6 +747,7 @@ def rgbd_slam(config: dict):
             do_continue_slam = False
             num_iters_tracking = config['tracking']['num_iters']
             progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+            # Tracking当前帧
             while True:
                 iter_start_time = time.time()
                 # Loss for current frame

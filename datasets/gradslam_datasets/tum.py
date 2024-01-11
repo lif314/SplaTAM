@@ -89,6 +89,7 @@ class TUMDataset(GradSLAMDataset):
 
         image_data = self.parse_list(image_list)
         depth_data = self.parse_list(depth_list)
+
         pose_data = self.parse_list(pose_list, skiprows=1)
         pose_vecs = pose_data[:, 1:].astype(np.float64)
 
@@ -96,7 +97,7 @@ class TUMDataset(GradSLAMDataset):
         tstamp_depth = depth_data[:, 0].astype(np.float64)
         tstamp_pose = pose_data[:, 0].astype(np.float64)
         associations = self.associate_frames(
-            tstamp_image, tstamp_depth, tstamp_pose)
+            tstamp_image, tstamp_depth,  tstamp_pose)
 
         indicies = [0]
         for i in range(1, len(associations)):
@@ -105,15 +106,16 @@ class TUMDataset(GradSLAMDataset):
             if t1 - t0 > 1.0 / frame_rate:
                 indicies += [i]
 
-        color_paths, depth_paths = [], []
+        color_paths, depth_paths, object_paths = [], [], []
         for ix in indicies:
             (i, j, k) = associations[ix]
             color_paths += [os.path.join(self.input_folder, image_data[i, 1])]
+            object_paths += [os.path.join(self.input_folder, image_data[i, 1].replace("rgb", "object_mask"))]
             depth_paths += [os.path.join(self.input_folder, depth_data[j, 1])]
 
         embedding_paths = None
 
-        return color_paths, depth_paths, embedding_paths
+        return color_paths, depth_paths, embedding_paths#, object_paths
     
     def load_poses(self):
         
