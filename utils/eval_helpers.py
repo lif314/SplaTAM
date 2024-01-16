@@ -17,6 +17,9 @@ from pytorch_msssim import ms_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 loss_fn_alex = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).cuda()
 
+
+from utils.render_utils import object_render, setup_object_camera, visualize_obj, feature_to_rgb
+
 def align(model, data):
     """Align two trajectories using the method of Horn (closed-form).
 
@@ -403,7 +406,7 @@ def eval_online(dataset, all_params, num_frames, eval_online_dir, sil_thres,
 
 
 def eval(dataset, final_params, num_frames, eval_dir, sil_thres, 
-         mapping_iters, add_new_gaussians, wandb_run=None, wandb_save_qual=False, eval_every=1, save_frames=False):
+         mapping_iters, add_new_gaussians, wandb_run=None, wandb_save_qual=False, eval_every=1, save_frames=False, use_semantic=False, classifier=None):
     print("Evaluating Final Parameters ...")
     psnr_list = []
     rmse_list = []
@@ -412,6 +415,8 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
     ssim_list = []
     plot_dir = os.path.join(eval_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
+    
+    save_frames=True
     if save_frames:
         render_rgb_dir = os.path.join(eval_dir, "rendered_rgb")
         os.makedirs(render_rgb_dir, exist_ok=True)
@@ -422,10 +427,23 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         depth_dir = os.path.join(eval_dir, "depth")
         os.makedirs(depth_dir, exist_ok=True)
 
+        if use_semantic:
+            object_dir = os.path.join(eval_dir, "object_mask")
+            os.makedirs(object_dir, exist_ok=True)
+            render_object_dir = os.path.join(eval_dir, "rendered_object")
+            os.makedirs(render_object_dir, exist_ok=True)
+            objects_feature16_dir = os.path.join(eval_dir, "objects_feature16")
+            os.makedirs(objects_feature16_dir, exist_ok=True)
+
+
     gt_w2c_list = []
     for time_idx in tqdm(range(num_frames)):
          # Get RGB-D Data & Camera Parameters
-        color, depth, intrinsics, pose = dataset[time_idx]
+        if use_semantic:
+            color, depth, intrinsics, pose, gt_objects = dataset[time_idx]
+        else:
+            color, depth, intrinsics, pose = dataset[time_idx]
+
         gt_w2c = torch.linalg.inv(pose)
         gt_w2c_list.append(gt_w2c)
         intrinsics = intrinsics[:3, :3]
@@ -439,6 +457,8 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             first_frame_w2c = torch.linalg.inv(pose)
             # Setup Camera
             cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
+            if use_semantic:
+                object_cam = setup_object_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
         
         # Skip frames if not eval_every
         if time_idx != 0 and (time_idx+1) % eval_every != 0:
@@ -450,7 +470,10 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
                                              camera_grad=False)
  
         # Define current frame data
-        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c}
+        if use_semantic:
+            curr_data = {'cam': cam, 'im': color, 'depth': depth, "obj": gt_objects, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c}
+        else:
+            curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c}
 
         # Initialize Render Variables
         rendervar = transformed_params2rendervar(final_params, transformed_pts)
@@ -480,7 +503,16 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
                         data_range=1.0, size_average=True)
         lpips_score = loss_fn_alex(torch.clamp(weighted_im.unsqueeze(0), 0.0, 1.0),
                                     torch.clamp(weighted_gt_im.unsqueeze(0), 0.0, 1.0)).item()
-
+        
+        # Render object and Calculate IoU
+        if use_semantic:
+            rendering_obj = object_render(final_params, curr_data, object_cam, iter_time_idx=time_idx, eval=True)
+            logits = classifier(rendering_obj)
+            pred_obj = torch.argmax(logits, dim=0)
+            pred_obj_mask = visualize_obj(pred_obj.cpu().numpy().astype(np.uint8))   
+            gt_rgb_mask = visualize_obj(gt_objects.cpu().numpy().astype(np.uint8))
+            rgb_mask = feature_to_rgb(rendering_obj)
+        
         psnr_list.append(psnr.cpu().numpy())
         ssim_list.append(ssim.cpu().numpy())
         lpips_list.append(lpips_score)
@@ -523,6 +555,12 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
             cv2.imwrite(os.path.join(rgb_dir, "gt_{:04d}.png".format(time_idx)), cv2.cvtColor(viz_gt_im*255, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(depth_dir, "gt_{:04d}.png".format(time_idx)), depth_colormap)
+
+            if use_semantic:
+                cv2.imwrite(os.path.join(object_dir, "gt_{:04d}.png".format(time_idx)), gt_rgb_mask)
+                cv2.imwrite(os.path.join(render_object_dir, "gs_{:04d}.png".format(time_idx)), pred_obj_mask)
+                cv2.imwrite(os.path.join(objects_feature16_dir, "{:04d}.png".format(time_idx)), rgb_mask)
+
         
         # Plot the Ground Truth and Rasterized RGB & Depth, along with Silhouette
         fig_title = "Time Step: {}".format(time_idx)

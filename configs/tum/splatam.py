@@ -8,18 +8,23 @@ primary_device = "cuda:0"
 # scenes = ["freiburg3_long_office_household"]
 scenes = ["freiburg1_desk"]
 
-seed = int(1)
+seed = int(3347)
+exp = "loss_3d_1k_1k"
 scene_name = scenes[int(0)]
+end_frame = 5
 
+use_semantic=True
 map_every = 1
 keyframe_every = 5
 mapping_window_size = 20
-tracking_iters = 200
-mapping_iters = 30
+tracking_iters = 300
+mapping_iters = 60
 scene_radius_depth_ratio = 2
 
-group_name = "TUM"
-run_name = f"{scene_name}_seed{seed}"
+# group_name = "TUM_FULL"
+group_name = "TUM_Test"
+
+run_name = f"{scene_name}_{exp}"
 
 data_dir = "/home/super/nerf/slam/SplaTAM/data/TUM"
 
@@ -31,8 +36,8 @@ config = dict(
     map_every=map_every, # Mapping every nth frame
     keyframe_every=keyframe_every, # Keyframe every nth frame
     mapping_window_size=mapping_window_size, # Mapping window size
-    report_global_progress_every=500, # Report Global Progress every nth frame
-    eval_every=500, # Evaluate every nth frame (at end of SLAM)
+    report_global_progress_every=25, # Report Global Progress every nth frame
+    eval_every=50, # Evaluate every nth frame (at end of SLAM)
     scene_radius_depth_ratio=scene_radius_depth_ratio, # Max First Frame Depth to Scene Radius Ratio (For Pruning/Densification)
     mean_sq_dist_method="projective", # ["projective", "knn"] (Type of Mean Squared Distance Calculation for Scale of Gaussians)
     report_iter_progress=False,
@@ -43,12 +48,20 @@ config = dict(
     # use_wandb=True,
     use_wandb=False,
     wandb=dict(
-        entity="theairlab",
-        project="SplaTAM",
+        entity="cslinfeili",
+        project="Semantic-SplaTAM",
         group=group_name,
         name=run_name,
         save_qual=False,
         eval_save_qual=True,
+    ),
+    use_semantic=use_semantic,
+    semantic=dict(
+        num_objects=16,
+        num_classes=256,
+        use_obj_3d_loss=True,
+        loss_obj_weight=1000.0,
+        loss_obj_3d_weight=1_000.0,
     ),
     data=dict(
         # basedir="./data/TUM_RGBD",
@@ -57,8 +70,9 @@ config = dict(
         sequence=f"rgbd_dataset_{scene_name}",
         desired_image_height=480,
         desired_image_width=640,
+        # SEMANTIC
         start=0,
-        end=2,
+        end=end_frame,
         stride=1,
         num_frames=-1,
     ),
@@ -85,6 +99,7 @@ config = dict(
             log_scales=0.0,
             cam_unnorm_rots=0.002,
             cam_trans=0.002,
+            obj_dc=0.0005
         ),
     ),
     mapping=dict(
@@ -109,6 +124,7 @@ config = dict(
             log_scales=0.001,
             cam_unnorm_rots=0.0000,
             cam_trans=0.0000,
+            obj_dc=0.001
         ),
         prune_gaussians=True, # Prune Gaussians during Mapping
         pruning_dict=dict( # Needs to be updated based on the number of mapping iterations

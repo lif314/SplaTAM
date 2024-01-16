@@ -110,6 +110,7 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         start: Optional[int] = 0,
         end: Optional[int] = -1,
         desired_height: int = 480,
+        use_semantic: bool = False,
         desired_width: int = 640,
         channels_first: bool = False,
         normalize_color: bool = False,
@@ -146,6 +147,7 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         self.embedding_dir = embedding_dir
         self.embedding_dim = embedding_dim
         self.relative_pose = relative_pose
+        self.use_semantic = use_semantic
 
         self.start = start
         self.end = end
@@ -167,12 +169,10 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         if "crop_edge" in config_dict["camera_params"].keys():
             self.crop_edge = config_dict["camera_params"]["crop_edge"]
 
-        load_object = True
-        self.object_paths = []
-        if load_object:
-            self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths()
+        if use_semantic:
+            self.color_paths, self.depth_paths, self.embedding_paths, self.object_paths = self.get_filepaths(self.use_semantic)
         else:
-            self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths()
+            self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths(use_semantic=False)
         
         
         if len(self.color_paths) != len(self.depth_paths):
@@ -188,6 +188,9 @@ class GradSLAMDataset(torch.utils.data.Dataset):
 
         self.color_paths = self.color_paths[self.start : self.end : stride]
         self.depth_paths = self.depth_paths[self.start : self.end : stride]
+        if use_semantic:
+            self.object_paths = self.object_paths[self.start : self.end : stride]
+
         if self.load_embeddings:
             self.embedding_paths = self.embedding_paths[self.start : self.end : stride]
         self.poses = self.poses[self.start : self.end : stride]
@@ -206,7 +209,7 @@ class GradSLAMDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_imgs
 
-    def get_filepaths(self):
+    def get_filepaths(self, use_semantic=False):
         """Return paths to color images, depth images. Implement in subclass."""
         raise NotImplementedError
 
@@ -303,12 +306,15 @@ class GradSLAMDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         color_path = self.color_paths[index]
         depth_path = self.depth_paths[index]
-        # object_path = self.object_paths[index]
-
+        
         color = np.asarray(imageio.imread(color_path), dtype=float)
         color = self._preprocess_color(color)
-        # objects =np.asarray(imageio.imread(object_path), dtype=float) if os.path.exists(object_path) else None
-        
+
+        if self.use_semantic:
+            object_path = self.object_paths[index]
+            objects = np.asarray(imageio.imread(object_path)) if os.path.exists(object_path) else None
+            objects = torch.from_numpy(objects)
+
         if ".png" in depth_path:
             # depth_data = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
             depth = np.asarray(imageio.imread(depth_path), dtype=np.int64)
@@ -332,9 +338,10 @@ class GradSLAMDataset(torch.utils.data.Dataset):
 
         pose = self.transformed_poses[index]
 
-        if self.load_embeddings:
+        if self.load_embeddings: # False
             embedding = self.read_embedding_from_file(self.embedding_paths[index])
-            return (
+            if self.use_semantic:
+                return (
                 color.to(self.device).type(self.dtype),
                 depth.to(self.device).type(self.dtype),
                 intrinsics.to(self.device).type(self.dtype),
@@ -343,10 +350,30 @@ class GradSLAMDataset(torch.utils.data.Dataset):
                 # self.retained_inds[index].item(),
             )
 
+            return (
+                color.to(self.device).type(self.dtype),
+                depth.to(self.device).type(self.dtype),
+                intrinsics.to(self.device).type(self.dtype),
+                pose.to(self.device).type(self.dtype),
+                objects.to(self.device).type(self.dtype),
+                embedding.to(self.device),  # Allow embedding to be another dtype
+                # self.retained_inds[index].item(),
+            )
+
+        if self.use_semantic:
+            return (
+                color.to(self.device).type(self.dtype),
+                depth.to(self.device).type(self.dtype),
+                intrinsics.to(self.device).type(self.dtype),
+                pose.to(self.device).type(self.dtype),
+                objects.to(self.device).type(self.dtype)
+                # self.retained_ind s[index].item(),
+            )
+        
         return (
             color.to(self.device).type(self.dtype),
             depth.to(self.device).type(self.dtype),
             intrinsics.to(self.device).type(self.dtype),
             pose.to(self.device).type(self.dtype),
-            # self.retained_inds[index].item(),
+            # self.retained_ind s[index].item(),
         )

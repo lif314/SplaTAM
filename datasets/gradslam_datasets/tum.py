@@ -75,7 +75,7 @@ class TUMDataset(GradSLAMDataset):
         pose[:3, 3] = pvec[:3]
         return pose
 
-    def get_filepaths(self):
+    def get_filepaths(self, use_semantic=False):
 
         frame_rate = 32
         """ read video data in tum-rgbd format """
@@ -106,16 +106,22 @@ class TUMDataset(GradSLAMDataset):
             if t1 - t0 > 1.0 / frame_rate:
                 indicies += [i]
 
-        color_paths, depth_paths, object_paths = [], [], []
+
+        color_paths, depth_paths = [], []
+        if use_semantic:
+            object_paths = []
         for ix in indicies:
             (i, j, k) = associations[ix]
             color_paths += [os.path.join(self.input_folder, image_data[i, 1])]
-            object_paths += [os.path.join(self.input_folder, image_data[i, 1].replace("rgb", "object_mask"))]
             depth_paths += [os.path.join(self.input_folder, depth_data[j, 1])]
+            if use_semantic:
+                object_paths += [os.path.join(self.input_folder, image_data[i, 1].replace("rgb", "object_mask"))]
 
         embedding_paths = None
-
-        return color_paths, depth_paths, embedding_paths#, object_paths
+        if use_semantic:
+            return color_paths, depth_paths, embedding_paths, object_paths
+        else:
+            return color_paths, depth_paths, embedding_paths
     
     def load_poses(self):
         

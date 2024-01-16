@@ -46,12 +46,12 @@ from utils.slam_helpers import (
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
+from utils.sh_utils import RGB2SH
+from utils.render_utils import object_render, setup_object_camera, loss_cls_3d
 
 # GaussianRasterizer
 from diff_gaussian_rasterization import GaussianRasterizer
-
-# object
-# from diff_gaussian_rasterization_object import GaussianRasterizer as GaussianRasterizerObject
+# from gaussian_renderer import render_image, render_silhouette, render_object
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -136,18 +136,34 @@ def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True,
         return point_cld
 
 
-def initialize_params(init_pt_cld, num_frames, mean3_sq_dist):
+def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, use_semantic=False):
     num_pts = init_pt_cld.shape[0]
     means3D = init_pt_cld[:, :3] # [num_gaussians, 3] 高斯中心的位置
     unnorm_rots = np.tile([1, 0, 0, 0], (num_pts, 1)) # [num_gaussians, 3]
     logit_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
-    params = {
-        'means3D': means3D, # 高斯中心的位置 3
-        'rgb_colors': init_pt_cld[:, 3:6], # rgb颜色 3
-        'unnorm_rotations': unnorm_rots, # 旋转 wxyz 4
-        'logit_opacities': logit_opacities, # 透明度 1
-        'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)), # 轴的长度 3
-    }
+    
+    # random init obj_id now
+    if use_semantic:
+        num_objects = 16
+        fused_objects = RGB2SH(torch.rand((num_pts, num_objects), device="cuda"))
+        fused_objects = fused_objects[:,:,None]
+        params = {
+            'means3D': means3D, # 高斯中心的位置 3
+            'rgb_colors': init_pt_cld[:, 3:6], # rgb颜色 3
+            'unnorm_rotations': unnorm_rots, # 旋转 wxyz 4
+            'logit_opacities': logit_opacities, # 透明度 1
+            # circle
+            'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)), # 轴的长度 3
+            "obj_dc": fused_objects.transpose(1, 2)
+        }
+    else:
+        params = {
+            'means3D': means3D, # 高斯中心的位置 3
+            'rgb_colors': init_pt_cld[:, 3:6], # rgb颜色 3
+            'unnorm_rotations': unnorm_rots, # 旋转 wxyz 4
+            'logit_opacities': logit_opacities, # 透明度 1
+            'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)), # 轴的长度 3
+        }
 
     # Initialize a single gaussian trajectory to model the camera poses relative to the first frame
     cam_rots = np.tile([1, 0, 0, 0], (1, 1))
@@ -179,10 +195,13 @@ def initialize_optimizer(params, lrs_dict, tracking):
         return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
 # 初始化第一帧的参数
-def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mean_sq_dist_method, densify_dataset=None):
+def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mean_sq_dist_method, densify_dataset=None, use_semantic=False):
     # Get RGB-D Data & Camera Parameters
     # 读取第一帧数据: RGBM depth, 相机内参，c2w相对位姿
-    color, depth, intrinsics, pose = dataset[0]
+    if use_semantic:
+        color, depth, intrinsics, pose, objects = dataset[0]
+    else:
+        color, depth, intrinsics, pose = dataset[0]
 
     # Process RGB-D Data
     color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
@@ -196,6 +215,8 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mea
     # Setup Camera
     # 设置相机参数
     cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), w2c.detach().cpu().numpy())
+    object_cam = setup_object_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), w2c.detach().cpu().numpy())
+    
 
     if densify_dataset is not None: # 不使用
         # Get Densification RGB-D Data & Camera Parameters
@@ -216,20 +237,21 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mea
                                                 mean_sq_dist_method=mean_sq_dist_method)
 
     # Initialize Parameters
-    params, variables = initialize_params(init_pt_cld, num_frames, mean3_sq_dist)
+    params, variables = initialize_params(init_pt_cld, num_frames, mean3_sq_dist, use_semantic=use_semantic)
 
     # Initialize an estimate of scene radius for Gaussian-Splatting Densification
-    variables['scene_radius'] = torch.max(depth)/scene_radius_depth_ratio
+    variables['scene_radius'] = torch.max(depth) / scene_radius_depth_ratio
 
     if densify_dataset is not None:
         return params, variables, intrinsics, w2c, cam, densify_intrinsics, densify_cam
     else:
-        return params, variables, intrinsics, w2c, cam
+        return params, variables, intrinsics, w2c, cam, object_cam
 
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1,ignore_outlier_depth_loss, tracking=False, 
-             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None):
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None,
+             use_semantic=False):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -288,9 +310,6 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     im, radius, _, = GaussianRasterizer(raster_settings=curr_data['cam'])(**rendervar)
     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
 
-    # TODO Object Rendering
-
-
     # Depth & Silhouette(轮廓) Rendering
     depth_sil, _, _, = GaussianRasterizer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     depth = depth_sil[0, :, :].unsqueeze(0)
@@ -330,8 +349,6 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         losses['im'] = torch.abs(curr_data['im'] - im).sum()
     else:
         losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
-
-    # Object Loss
     
 
     # Visualize the Diff Images
@@ -392,18 +409,36 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     return loss, variables, weighted_losses
 
 
-def initialize_new_params(new_pt_cld, mean3_sq_dist):
+def initialize_new_params(new_pt_cld, mean3_sq_dist, use_semantic=False):
     num_pts = new_pt_cld.shape[0]
     means3D = new_pt_cld[:, :3] # [num_gaussians, 3]
     unnorm_rots = np.tile([1, 0, 0, 0], (num_pts, 1)) # [num_gaussians, 3]
     logit_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
-    params = {
-        'means3D': means3D,
-        'rgb_colors': new_pt_cld[:, 3:6],
-        'unnorm_rotations': unnorm_rots,
-        'logit_opacities': logit_opacities,
-        'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)),
-    }
+
+    # random init obj_id now
+    if use_semantic:
+        num_objects = 16
+        # random init obj_id now
+        fused_objects = RGB2SH(torch.rand((num_pts, num_objects), device="cuda"))
+        fused_objects = fused_objects[:,:,None]
+
+        params = {
+            'means3D': means3D, # 高斯中心的位置 3
+            'rgb_colors': new_pt_cld[:, 3:6], # rgb颜色 3
+            'unnorm_rotations': unnorm_rots, # 旋转 wxyz 4
+            'logit_opacities': logit_opacities, # 透明度 1
+            'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)), # 轴的长度 3
+            "obj_dc": fused_objects.transpose(1, 2)
+        }
+    else:
+        params = {
+            'means3D': means3D, # 高斯中心的位置 3
+            'rgb_colors': new_pt_cld[:, 3:6], # rgb颜色 3
+            'unnorm_rotations': unnorm_rots, # 旋转 wxyz 4
+            'logit_opacities': logit_opacities, # 透明度 1
+            'log_scales': torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1)), # 轴的长度 3
+        }
+
     for k, v in params.items():
         # Check if value is already a torch tensor
         if not isinstance(v, torch.Tensor):
@@ -415,7 +450,7 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist):
 
 
 # 从当前帧中创建新的高斯集
-def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx, mean_sq_dist_method):
+def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx, mean_sq_dist_method, use_semantic=False):
     # Silhouette Rendering
     transformed_pts = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
@@ -448,7 +483,7 @@ def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx, mean_sq
                                     curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
                                     mean_sq_dist_method=mean_sq_dist_method)
         # 新的高斯集：从点云中创建高斯集
-        new_params = initialize_new_params(new_pt_cld, mean3_sq_dist)
+        new_params = initialize_new_params(new_pt_cld, mean3_sq_dist, use_semantic)
         # 将新的高斯集中参数放入优化器中
         for k, v in new_params.items():
             # 加入到整个高斯集中
@@ -516,7 +551,6 @@ def rgbd_slam(config: dict):
     os.makedirs(eval_dir, exist_ok=True)
     
     # Init WandB
-    # 默认不使用wandb
     if config['use_wandb']:
         wandb_time_step = 0
         wandb_tracking_step = 0
@@ -567,6 +601,10 @@ def rgbd_slam(config: dict):
         else:
             seperate_tracking_res = False
 
+    # semantic
+    if config["use_semantic"]:
+        semantic_config = config["semantic"]
+
 
     # Poses are relative to the first frame
     dataset = get_dataset(
@@ -575,6 +613,7 @@ def rgbd_slam(config: dict):
         sequence=os.path.basename(dataset_config["sequence"]),
         start=dataset_config["start"],
         end=dataset_config["end"],
+        use_semantic=config["use_semantic"],
         stride=dataset_config["stride"],
         desired_height=dataset_config["desired_image_height"],
         desired_width=dataset_config["desired_image_width"],
@@ -587,6 +626,9 @@ def rgbd_slam(config: dict):
     num_frames = dataset_config["num_frames"]
     if num_frames == -1:
         num_frames = len(dataset)
+
+    # color, depth, intrinsics, pose, objects = dataset[0]
+    # print(color.shape, depth.shape, intrinsics.shape, objects.shape)
 
     # Init seperate dataloader for densification if required
     # 默认False
@@ -614,9 +656,10 @@ def rgbd_slam(config: dict):
     else:
         # Initialize Parameters & Canoncial Camera parameters
         # 用第一帧初始化参数
-        params, variables, intrinsics, first_frame_w2c, cam = initialize_first_timestep(dataset, num_frames, 
+        params, variables, intrinsics, first_frame_w2c, cam, object_cam = initialize_first_timestep(dataset, num_frames, 
                                                                                         config['scene_radius_depth_ratio'],
-                                                                                        config['mean_sq_dist_method'])
+                                                                                        config['mean_sq_dist_method'],
+                                                                                        use_semantic=config["use_semantic"])
     
     # Init seperate dataloader for tracking if required
     # 默认False
@@ -640,7 +683,6 @@ def rgbd_slam(config: dict):
         tracking_intrinsics = tracking_intrinsics[:3, :3]
         tracking_cam = setup_camera(tracking_color.shape[2], tracking_color.shape[1], 
                                     tracking_intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
-    
 
     # Initialize list to keep track of Keyframes
     # 关键帧
@@ -695,11 +737,23 @@ def rgbd_slam(config: dict):
                 keyframe_list.append(curr_keyframe)
     else:
         checkpoint_time_idx = 0
+
+
+    if config["use_semantic"]:
+        classifier = torch.nn.Conv2d(semantic_config["num_objects"], semantic_config["num_classes"], kernel_size=1)
+        cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
+        classifier.cuda()
     
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
-        color, depth, _, gt_pose = dataset[time_idx]
+        if config["use_semantic"]:
+            color, depth, _, gt_pose, objects = dataset[time_idx]
+        else:
+            color, depth, _, gt_pose = dataset[time_idx]
+            objects = None
+        
         # Process poses
         gt_w2c = torch.linalg.inv(gt_pose)
         # Process RGB-D Data
@@ -712,7 +766,7 @@ def rgbd_slam(config: dict):
         # Initialize Mapping Data for selected frame
         # 当前帧数据
         curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': iter_time_idx, 'intrinsics': intrinsics, 
-                     'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
+                     'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "obj": objects}
         
         # Initialize Data for Tracking
         if seperate_tracking_res:
@@ -756,14 +810,50 @@ def rgbd_slam(config: dict):
                                                    config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
                                                    tracking_iteration=iter)
+
+                if config["use_semantic"]:
+                    # object loss
+                    objects = object_render(params, tracking_curr_data, object_cam, iter_time_idx, tracking=True)
+                    gt_obj = tracking_curr_data["obj"].long()
+                    logits = classifier(objects)
+                    loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
+                    loss_obj = loss_obj / torch.log(torch.tensor(semantic_config["num_classes"]))  # normalize to (0,1)
+                    # print("loss_obj: ", loss_obj.detach())
+                    loss += loss_obj * semantic_config["loss_obj_weight"]
+
+                    # object 3d loss
+                    reg3d_interval = 20
+                    if iter % reg3d_interval == 0:
+                        # regularize at certain intervals
+                        logits3d = classifier(params["obj_dc"].permute(2,0,1))
+                        prob_obj3d = torch.softmax(logits3d, dim=0).squeeze().permute(1,0)
+                        # 3d object loss
+                        transformed_pts = transform_to_frame(params, iter_time_idx, 
+                                             gaussians_grad=False,
+                                             camera_grad=True)
+                        reg3d_k = 5
+                        reg3d_lambda_val = 2
+                        reg3d_max_points = 200000
+                        reg3d_sample_size = 1000
+                        loss_obj_3d = loss_cls_3d(transformed_pts.squeeze().detach(), prob_obj3d, reg3d_k, reg3d_lambda_val, reg3d_max_points, reg3d_sample_size)
+                        loss += loss_obj_3d * semantic_config["loss_obj_3d_weight"]
+
+                        # print("loss_obj: ", loss_obj.detach(), "loss_3d: ",loss_obj_3d.detach())
+                
                 if config['use_wandb']:
                     # Report Loss
                     wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
                 # Backprop
+                # print("loss: ", loss.detach())
                 loss.backward()
                 # Optimizer Update
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+                if config["use_semantic"]:
+                    cls_optimizer.step()
+                    cls_optimizer.zero_grad()
+                
                 with torch.no_grad():
                     # Save the best candidate rotation & translation
                     if loss < current_min_loss:
@@ -852,7 +942,8 @@ def rgbd_slam(config: dict):
                 # Add new Gaussians to the scene based on the Silhouette
                 params, variables = add_new_gaussians(params, variables, densify_curr_data, 
                                                       config['mapping']['sil_thres'], time_idx,
-                                                      config['mean_sq_dist_method'])
+                                                      config['mean_sq_dist_method'],
+                                                      use_semantic=config["use_semantic"])
                 post_num_pts = params['means3D'].shape[0]
                 if config['use_wandb']:
                     wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
@@ -896,18 +987,60 @@ def rgbd_slam(config: dict):
                     iter_time_idx = time_idx
                     iter_color = color
                     iter_depth = depth
+                    if config["use_semantic"]:
+                        iter_object = objects
                 else:
                     # Use Keyframe Data
                     iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
                     iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
                     iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
+                    if config["use_semantic"]:
+                        iter_object = keyframe_list[selected_rand_keyframe_idx]['obj']
+
                 iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
-                iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
+                
+                if config["use_semantic"]:
+                    iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
+                             'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
+                             "obj": iter_object}
+                else:
+                    iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
+                    
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
                                                 config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True)
+                
+                
+                # if config["use_semantic"]:
+                #     # object loss
+                #     objects = object_render(params, iter_data, object_cam, iter_time_idx, tracking=False, mapping=True)
+                #     gt_obj = tracking_curr_data["obj"].long()
+                #     logits = classifier(objects)
+                #     loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
+                #     loss_obj = loss_obj / torch.log(torch.tensor(semantic_config["num_classes"]))  # normalize to (0,1)
+                #     # print("loss_obj: ", loss_obj.detach())
+                #     loss += loss_obj *  semantic_config["loss_obj_weight"]
+
+                #     # object 3d loss
+                #     reg3d_interval = 20
+                #     if iter % reg3d_interval == 0:
+                #         # regularize at certain intervals
+                #         logits3d = classifier(params["obj_dc"].permute(2,0,1))
+                #         prob_obj3d = torch.softmax(logits3d, dim=0).squeeze().permute(1,0)
+                #         # 3d object loss
+                #         transformed_pts = transform_to_frame(params, iter_time_idx, 
+                #                              gaussians_grad=True,
+                #                              camera_grad=False)
+                #         reg3d_k = 5
+                #         reg3d_lambda_val = 2
+                #         reg3d_max_points = 200000
+                #         reg3d_sample_size = 1000
+                #         loss_obj_3d = loss_cls_3d(transformed_pts.squeeze().detach(), prob_obj3d, reg3d_k, reg3d_lambda_val, reg3d_max_points, reg3d_sample_size)
+                #         loss += loss_obj_3d * semantic_config["loss_obj_3d_weight"]
+
+                
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -929,6 +1062,11 @@ def rgbd_slam(config: dict):
                     # Optimizer Update
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # if config["use_semantic"]:
+                    #     cls_optimizer.step()
+                    #     cls_optimizer.zero_grad()
+
                     # Report Progress
                     if config['report_iter_progress']:
                         if config['use_wandb']:
@@ -980,7 +1118,11 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
+                if config["use_semantic"]:
+                    curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, "obj":objects}
+                else:
+                    curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
+
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
@@ -1025,11 +1167,15 @@ def rgbd_slam(config: dict):
             eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  wandb_run=wandb_run, wandb_save_qual=config['wandb']['eval_save_qual'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
-                 eval_every=config['eval_every'])
+                 eval_every=config['eval_every'],
+                 use_semantic=config["use_semantic"],
+                 classifier=classifier if config["use_semantic"] else None)
         else:
             eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
-                 eval_every=config['eval_every'])
+                 eval_every=config['eval_every'],
+                 use_semantic=config["use_semantic"],
+                 classifier=classifier if config["use_semantic"] else None)
 
     # Add Camera Parameters to Save them
     params['timestep'] = variables['timestep']
@@ -1045,6 +1191,8 @@ def rgbd_slam(config: dict):
     
     # Save Parameters
     save_params(params, output_dir)
+    if config["use_semantic"]:
+        torch.save(classifier.state_dict(), os.path.join(output_dir, "classifier.pth"))
 
     # Close WandB Run
     if config['use_wandb']:
